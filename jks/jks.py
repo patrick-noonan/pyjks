@@ -10,9 +10,27 @@ import struct
 import hashlib
 import collections
 from pyasn1.codec.ber import decoder
+import javaobj
+
+try:
+    # Python 2
+    from StringIO import StringIO as BytesIO
+
+except ImportError:
+    # Python 3+
+    from io import BytesIO
+
+from sys import version_info
+
+if version_info[0] <= 2:
+    pass
+else:
+    unicode = str
+from pyasn1.compat.octets import ints2octs,octs2str
 
 class KeyStore(object):
-    def __init__(self, private_keys, certs):
+    def __init__(self, private_keys, certs, secret_keys):
+        self.secret_keys = secret_keys
         self.private_keys = private_keys
         self.certs = certs
 
@@ -40,6 +58,7 @@ class KeyStore(object):
         pos = 12
         private_keys = []
         certs = []
+        secret_keys = []
 
         for i in range(entry_count):
             tag = b4.unpack_from(data, pos)[0]
@@ -90,17 +109,41 @@ class KeyStore(object):
             elif tag == 3:
                 if filetype != 'jceks':
                     raise ValueError("Unexpected entry tag {0} encountered in JKS keystore; only supported in JCEKS keystores".format(tag))
-                # TODO: implement me
+                f = BytesIO(data[pos:])
+                marshaller = javaobj.JavaObjectUnmarshaller(f)
+                pobj = marshaller.readObject()
+                pos += f.tell()
+
+                assert(pobj.sealAlg == "PBEWithMD5AndTripleDES")
+                assert(pobj.paramsAlg == "PBEWithMD5AndTripleDES")
+                assert (str(pobj.classdesc) == "[com.sun.crypto.provider.SealedObjectForKeyProtector:0xCD57CA59]")
+                assert (pobj.classdesc.name == "com.sun.crypto.provider.SealedObjectForKeyProtector")
+                assert (pobj.classdesc.serialVersionUID == 0xCD57CA59)
+
+                asn1_secretkey = decoder.decode(_java_signed_array_to_octects(pobj.encodedParams))
+                salt = asn1_secretkey[0][0]
+                iteration_count = int(asn1_secretkey[0][1])
+                plaintext = _sun_jce_pkey_decrypt(_java_signed_array_to_octects(pobj.encryptedContent),
+                                                  password, bytes(salt), iteration_count)
+                f = BytesIO(plaintext)
+                marshaller = javaobj.JavaObjectUnmarshaller(f)
+                pobj = marshaller.readObject()
+                assert (pobj.classdesc.name == "javax.crypto.spec.SecretKeySpec")
+                assert (pobj.classdesc.serialVersionUID == 0x5B470B66)
+
+                secret_keys.append(SecretKey(alias, timestamp, pobj.algorithm ,len(pobj.key)*8,
+                                             _java_signed_array_to_unsigned(pobj.key)))
 
         # the keystore integrity check uses the UTF-16BE encoding of the password
         password_utf16 = password.encode('utf-16be')
         if hashlib.sha1(password_utf16 + SIGNATURE_WHITENING + data[:pos]).digest() != data[pos:]:
             raise ValueError("Hash mismatch; incorrect password or data corrupted")
 
-        return cls(private_keys, certs)
+        return cls(private_keys, certs, secret_keys)
 
 Cert = collections.namedtuple("Cert", "alias timestamp type cert")
 PrivateKey = collections.namedtuple("PrivateKey", "alias timestamp pkey cert_chain")
+SecretKey = collections.namedtuple("SecretKey", "alias timestamp algo size key")
 
 b8 = struct.Struct('>Q')
 b4 = struct.Struct('>L')
@@ -171,11 +214,11 @@ def _sun_jce_derive_cipher_key_iv(password, salt, iteration_count):
     if salt_halves[0] == salt_halves[1]:
         salt_halves[0] = salt_halves[0][::-1] # reversed
 
-    derived = ''
+    derived = b''
     for i in range(2):
         to_be_hashed = salt_halves[i]
         for k in range(iteration_count):
-            to_be_hashed = hashlib.md5(to_be_hashed + password).digest()
+            to_be_hashed = hashlib.md5(to_be_hashed + password.encode()).digest()
         derived += to_be_hashed
 
     key = derived[:-8] # = 24 bytes
@@ -188,7 +231,21 @@ def _strip_pkcs5_padding(m):
     if last_byte <= 0 or last_byte > 8:
         raise ValueError("Unable to strip PKCS5 padding: invalid padding found")
     # the <last_byte> bytes of m must all have value <last_byte>, otherwise something's wrong
-    if m[-last_byte:] != chr(last_byte)*last_byte:
+    padding = chr(last_byte)*last_byte
+    if m[-last_byte:] != padding.encode():
         raise ValueError("Unable to strip PKCS5 padding: invalid padding found")
 
     return m[:-last_byte]
+
+def _java_signed_array_to_unsigned(java_array):
+    new_unsigned = []
+    for signed in java_array:
+        if signed < 0:
+            new_unsigned.append(signed+0x100)
+        else:
+            new_unsigned.append(signed)
+
+    return new_unsigned
+
+def _java_signed_array_to_octects(java_array):
+    return ints2octs(_java_signed_array_to_unsigned(java_array))

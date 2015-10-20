@@ -35,13 +35,15 @@ class KeyStore(object):
         self.certs = certs
 
     @classmethod
-    def load(cls, filename, password):
+    def load(cls, filename, password, skpassword = None):
         with open(filename, 'rb') as file:
-            return cls.loads(file.read(), password)
+            return cls.loads(file.read(), password, skpassword)
 
     @classmethod
-    def loads(cls, data, password):
+    def loads(cls, data, password, skpassword = None):
         filetype = ''
+        if skpassword is  None:
+            skpassword = password
         magic_number = data[:4]
         if magic_number == MAGIC_NUMBER_JKS:
             filetype = 'jks'
@@ -124,7 +126,7 @@ class KeyStore(object):
                 salt = asn1_secretkey[0][0]
                 iteration_count = int(asn1_secretkey[0][1])
                 plaintext = _sun_jce_pkey_decrypt(_java_signed_array_to_octects(pobj.encryptedContent),
-                                                  password, bytes(salt), iteration_count)
+                                                  skpassword, bytes(salt), iteration_count)
                 f = BytesIO(plaintext)
                 marshaller = javaobj.JavaObjectUnmarshaller(f)
                 pobj = marshaller.readObject()

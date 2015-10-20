@@ -1,4 +1,4 @@
-pyjks (WORK IN PROGRESS...DO NOT USE)
+pyjks 
 =====
 
 A pure python Java KeyStore file parser, including private and secret key decryption.
